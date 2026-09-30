@@ -76,3 +76,64 @@ To verify the album art is what spins on the disk, render four local preview fra
 ```bash
 python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
 ```
+
+## Hardware controls
+
+Three momentary push buttons and one rotary encoder (KY-040 style) are wired to the SEENGREAT breakout header, all handled by `buttons.py` and `encoder.py`.
+
+### Buttons (`buttons.py`)
+
+| Button | GPIO (BCM) | Short press | Long press (2s+) |
+|---|---|---|---|
+| Play/Pause | 19 | Toggle playback | Clean shutdown (`sudo shutdown now`) |
+| Next | 20 | Skip to next track | - |
+| Previous | 16 | Skip to previous track | - |
+
+### Volume encoder (`encoder.py`)
+
+| Signal | GPIO (BCM) |
+|---|---|
+| CLK | 21 |
+| DT | 13 |
+| SW (push-button) | 6 |
+
+- Rotate clockwise/counter-clockwise: volume up/down in 5% steps.
+- Press the knob: mute/unmute (remembers the volume to restore to).
+
+Volume changes are batched (see `TICK` and `STEPS_PER_CLICK` in `encoder.py`) rather than firing one API call per encoder step, to avoid Spotify's rate limit on fast spins.
+
+**Note on GPIO pin choice:** with `--hardware-mapping regular`, the matrix library uses GPIO 17, 18, 22, 23, 24, 25 for panel control. Do not wire buttons or the encoder to those pins — they will conflict with the display and cause flicker or garbage input.
+
+## Limitations
+
+- **Play/pause/skip/volume/mute all require an active Spotify device.** If nothing is currently playing anywhere, the first press after a cold start returns a 404 (`NO_ACTIVE_DEVICE`). Start playback on any device first, then the buttons/knob will control it.
+- **Volume control depends on the playing device supporting it.** Spotify's iOS and Android apps report `supports_volume: False` and reject remote volume/mute commands (`403 VOLUME_CONTROL_DISALLOW`), even when playing to a Bluetooth speaker. This works reliably from the Spotify desktop app or a native Spotify Connect speaker (Sonos, Chromecast, etc.), but not from a phone.
+- **Skip-previous can return a 403** if Spotify's own "restart vs. skip back" restriction kicks in near the start of a track. This is normal Spotify behavior, not a bug.
+- **The app is registered in Spotify's Development Mode**, so only accounts explicitly added under the app's dashboard (Settings -> Users and Access) can authorize it, up to 25 people.
+- **Only one Spotify account is "active" at a time.** Tokens for multiple people are supported via `.cache/tokens/<name>.json` and `switch_user.sh <name>`, but switching requires restarting the services — there's no automatic multi-user detection yet.
+
+## Running on boot (systemd)
+
+Four services keep everything running automatically after power-on, with no SSH required:
+
+- `spotify-fetcher.service` - polls Spotify and writes album art/state (`fetcher.py`)
+- `spotify-display.service` - renders the LED matrix (`display.py`)
+- `spotify-buttons.service` - play/pause/next/previous (`buttons.py`)
+- `spotify-encoder.service` - volume/mute knob (`encoder.py`)
+
+Unit files live in `/etc/systemd/system/`. To check status or logs:
+
+```bash
+sudo systemctl status spotify-fetcher spotify-display spotify-buttons spotify-encoder
+sudo journalctl -u spotify-buttons -u spotify-encoder -n 50 --no-pager
+```
+
+To restart everything (e.g. after changing `.env` or a script):
+
+```bash
+sudo systemctl restart spotify-fetcher spotify-display spotify-buttons spotify-encoder
+```
+
+### Shutting down safely
+
+Do not unplug power directly. Long-press the play/pause button (GPIO 19) to trigger a clean shutdown, wait for the green activity LED to go dark and stay off, then it's safe to disconnect power.
