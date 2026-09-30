@@ -10,9 +10,6 @@ import tempfile
 import threading
 import time
 import urllib.parse
-import urllib.request
-from email.message import Message
-from urllib.error import HTTPError
 import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -20,6 +17,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import requests
 from PIL import Image
 
 try:
@@ -32,10 +30,14 @@ except ImportError:
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
-SCOPE = "user-read-currently-playing"
+SCOPE = "user-read-currently-playing user-modify-playback-state user-read-playback-state"
 
 DEFAULT_STATE_PATH = Path("/tmp/spotify_matrix_state.json")
 DEFAULT_ART_PATH = Path("/tmp/spotify_matrix_art.png")
+
+# CHANGE: one shared, persistent connection pool reused across every poll,
+# instead of opening a fresh connection (and TLS handshake) each time.
+_session = requests.Session()
 
 
 @dataclass
@@ -48,7 +50,7 @@ class PlaybackArt:
 @dataclass
 class HttpResponse:
     status: int
-    headers: Message
+    headers: Any
     body: bytes
 
     def json(self) -> dict[str, Any]:
@@ -64,23 +66,17 @@ def http_request(
     headers: dict[str, str] | None = None,
     timeout: float = 10,
 ) -> HttpResponse:
-    if params:
-        separator = "&" if urllib.parse.urlparse(url).query else "?"
-        url = f"{url}{separator}{urllib.parse.urlencode(params)}"
-
-    encoded_data = urllib.parse.urlencode(data).encode("utf-8") if data else None
-    request = urllib.request.Request(
+    # CHANGE: uses the shared _session (keep-alive) instead of urllib.request,
+    # which opened a brand-new connection on every call.
+    response = _session.request(
+        method,
         url,
-        data=encoded_data,
+        params=params,
+        data=data,
         headers=headers or {},
-        method=method,
+        timeout=timeout,
     )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return HttpResponse(response.status, response.headers, response.read())
-    except HTTPError as exc:
-        return HttpResponse(exc.code, exc.headers, exc.read())
+    return HttpResponse(response.status_code, response.headers, response.content)
 
 
 def raise_http_error(response: HttpResponse, context: str) -> None:
@@ -126,6 +122,85 @@ class SpotifyClient:
         if response.status != 200:
             raise_http_error(response, "Spotify currently-playing request")
 
+        return response.json()
+
+    def toggle_playback(self) -> None:
+        playback = self.get_currently_playing()
+        is_playing = bool(playback and playback.get("is_playing"))
+        endpoint = "pause" if is_playing else "play"
+
+        token = self._valid_access_token()
+        response = http_request(
+            "PUT",
+            f"https://api.spotify.com/v1/me/player/{endpoint}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status == 401:
+            self._refresh_access_token()
+            return self.toggle_playback()
+        if response.status not in (200, 204):
+            raise_http_error(response, f"Spotify {endpoint} request")
+
+    def next_track(self) -> None:
+        token = self._valid_access_token()
+        response = http_request(
+            "POST",
+            "https://api.spotify.com/v1/me/player/next",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status == 401:
+            self._refresh_access_token()
+            return self.next_track()
+        if response.status not in (200, 204):
+            raise_http_error(response, "Spotify next request")
+
+    def previous_track(self) -> None:
+        token = self._valid_access_token()
+        response = http_request(
+            "POST",
+            "https://api.spotify.com/v1/me/player/previous",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status == 401:
+            self._refresh_access_token()
+            return self.previous_track()
+        if response.status not in (200, 204):
+            raise_http_error(response, "Spotify previous request")
+
+    def set_volume(self, percent: int) -> None:
+        percent = max(0, min(100, percent))
+        token = self._valid_access_token()
+        response = http_request(
+            "PUT",
+            "https://api.spotify.com/v1/me/player/volume",
+            params={"volume_percent": str(percent)},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status == 401:
+            self._refresh_access_token()
+            return self.set_volume(percent)
+        if response.status not in (200, 204):
+            raise_http_error(response, "Spotify volume request")
+
+    def get_playback_state(self) -> dict[str, Any] | None:
+        token = self._valid_access_token()
+        response = http_request(
+            "GET",
+            "https://api.spotify.com/v1/me/player",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status == 204:
+            return None
+        if response.status == 401:
+            self._refresh_access_token()
+            return self.get_playback_state()
+        if response.status != 200:
+            raise_http_error(response, "Spotify playback-state request")
         return response.json()
 
     def authorize(self) -> None:
@@ -351,9 +426,8 @@ def encode_png(image: Image.Image) -> bytes:
 
 
 def download_and_decode_image(url: str) -> Image.Image:
-    import requests
-
-    response = requests.get(url, timeout=15)
+    # CHANGE: also reuses the shared _session instead of opening a new connection.
+    response = _session.get(url, timeout=15)
     response.raise_for_status()
     return Image.open(BytesIO(response.content)).convert("RGB")
 
@@ -437,7 +511,8 @@ def positive_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Poll Spotify and write album art + state for the display process.")
-    parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
+    # CHANGE: default lowered from 2.0 to 1.0 seconds for faster song-change detection.
+    parser.add_argument("--poll-seconds", type=positive_float, default=1.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--art-path", type=Path, default=DEFAULT_ART_PATH)

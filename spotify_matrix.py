@@ -384,12 +384,29 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
     )
 
 
+_ALBUM_ART_TEMP_PATH = "/tmp/album_art_current.jpg"
+
 def download_image(url: str) -> Image.Image:
     import requests
+    import os
+    import time as _time
 
     response = requests.get(url, timeout=15)
     response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGB")
+
+    with open(_ALBUM_ART_TEMP_PATH, "wb") as f:
+        f.write(response.content)
+        f.flush()
+        os.fsync(f.fileno())
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            return Image.open(_ALBUM_ART_TEMP_PATH).convert("RGB")
+        except Exception as exc:
+            last_error = exc
+            _time.sleep(0.1)
+    raise last_error
 
 
 def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Image:
