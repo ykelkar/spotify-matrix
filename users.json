@@ -1,0 +1,7 @@
+{
+  "order": ["yash", "madhuri"],
+  "display": {
+    "yash": "YASH",
+    "madhuri": "MAD"
+  }
+}

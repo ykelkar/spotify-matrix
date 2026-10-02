@@ -11,6 +11,7 @@ Image.init()
 
 DEFAULT_STATE_PATH = Path("/tmp/spotify_matrix_state.json")
 DEFAULT_ART_PATH = Path("/tmp/spotify_matrix_art.png")
+DEFAULT_FLASH_PATH = Path("/tmp/spotify_matrix_flash.json")
 
 
 class MatrixDisplay:
@@ -136,6 +137,55 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
     return frame
 
 
+
+def _load_flash_font(size: int):
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+    except Exception:
+        return None
+
+
+def render_flash(text: str, size: int) -> Image.Image:
+    from PIL import ImageFont
+
+    frame = Image.new("RGB", (size, size), (0, 0, 0))
+    font = _load_flash_font(int(size * 0.5))
+
+    if font is not None:
+        draw = ImageDraw.Draw(frame)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (size - w) // 2 - bbox[0]
+        y = (size - h) // 2 - bbox[1]
+        draw.text((x, y), text, font=font, fill=(255, 255, 255))
+        return frame
+
+    # Fallback if no truetype font is installed: draw small, scale up with NEAREST.
+    default_font = ImageFont.load_default()
+    tmp = Image.new("RGB", (200, 40), (0, 0, 0))
+    tdraw = ImageDraw.Draw(tmp)
+    bbox = tdraw.textbbox((0, 0), text, font=default_font)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tmp = tmp.crop((0, 0, w + 4, h + 4))
+    tdraw = ImageDraw.Draw(tmp)
+    tdraw.text((2 - bbox[0], 2 - bbox[1]), text, font=default_font, fill=(255, 255, 255))
+    scale = max(1, int(size * 0.8 / max(tmp.width, 1)))
+    scaled = tmp.resize((tmp.width * scale, tmp.height * scale), Image.NEAREST)
+    frame.paste(scaled, ((size - scaled.width) // 2, (size - scaled.height) // 2))
+    return frame
+
+
+def load_flash_raw(flash_path: Path) -> tuple[str, float] | None:
+    """Returns (text, written_at) if the file is readable, else None."""
+    try:
+        with flash_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("text"), data.get("written_at", 0)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
 def load_state(state_path: Path) -> dict:
     try:
         with state_path.open("r", encoding="utf-8") as f:
@@ -178,10 +228,20 @@ def run(args: argparse.Namespace) -> None:
     last_frame = time.monotonic()
     loaded_key = None
     art_image: Image.Image | None = None
+    flash_text: str | None = None
+    flash_shown_at = 0.0
+    flash_last_written_at = 0.0
 
     try:
         while True:
             frame_start = time.monotonic()
+            raw = load_flash_raw(args.flash_path)
+            if raw and raw[1] != flash_last_written_at:
+                flash_text = raw[0]
+                flash_last_written_at = raw[1]
+                flash_shown_at = time.monotonic()
+            if flash_text is not None and time.monotonic() - flash_shown_at > args.flash_seconds:
+                flash_text = None
             state = load_state(args.state_path)
             is_playing = bool(state.get("is_playing"))
             has_art = bool(state.get("has_art"))
@@ -204,7 +264,10 @@ def run(args: argparse.Namespace) -> None:
             if is_playing and art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
 
-            image = render_record(art_image, angle, size) if art_image is not None else idle
+            if flash_text:
+                image = render_flash(flash_text, size)
+            else:
+                image = render_record(art_image, angle, size) if art_image is not None else idle
             display.show(image)
 
             if args.once:
@@ -234,6 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpm", type=positive_float, default=20.0)
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--art-path", type=Path, default=DEFAULT_ART_PATH)
+    parser.add_argument("--flash-path", type=Path, default=DEFAULT_FLASH_PATH)
+    parser.add_argument("--flash-seconds", type=positive_float, default=1.0)
     parser.add_argument("--mock-output", type=Path)
     parser.add_argument("--test-pattern", action="store_true")
     parser.add_argument("--once", action="store_true")
